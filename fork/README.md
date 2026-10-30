@@ -82,5 +82,6 @@ Tests for 2-5: `go/cycletls/index_websocket_test.go` and
 import initCycleTLS from '@emircansahin/cycletls';
 ```
 
-Same API as `cycletls@2.0.5`. To rebuild: `fork/build.sh <out-dir>` on the
-`fixes/2.0.5` branch of the fork.
+Same API as `cycletls@2.0.5`. Source: the `fixes/2.0.5` branch of
+[emircan-sahin/cycletls](https://github.com/emircan-sahin/cycletls/tree/fixes/2.0.5); to rebuild,
+`fork/build.sh <out-dir>` there.

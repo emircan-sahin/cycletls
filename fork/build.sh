@@ -57,6 +57,9 @@ node -e '
     description: "CycleTLS 2.0.5 with fixes for kept connections, WebSocket client leaks, a transport map race, stalled proxies and request id collisions",
     files: ["/dist", "/go"],
     license: "GPL-3.0",
+    repository: { type: "git", url: "git+https://github.com/emircan-sahin/cycletls.git", directory: "fork" },
+    bugs: { url: "https://github.com/emircan-sahin/cycletls/issues" },
+    homepage: "https://github.com/emircan-sahin/cycletls/tree/fixes/2.0.5/fork#readme",
   });
   delete pkg.scripts;
   delete pkg.devDependencies;
