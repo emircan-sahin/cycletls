@@ -213,8 +213,11 @@ func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.
 	rt.Lock()
 	defer rt.Unlock()
 
-	// Return cached connection if available
+	// The connection negotiated in getTransport is handed to the transport once. Kept in the
+	// cache, it came back to every later dial after it closed, and the host failed for good
+	// with "use of closed network connection".
 	if conn := rt.cachedConnections[addr]; conn != nil {
+		delete(rt.cachedConnections, addr)
 		return conn, nil
 	}
 
