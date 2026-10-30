@@ -6,7 +6,7 @@
 set -euo pipefail
 
 UPSTREAM=2.0.5
-VERSION=2.0.5-patch.2
+VERSION=2.0.5-patch.3
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$(mkdir -p "$1" && cd "$1" && pwd)"
 PKG="$OUT/package"
