@@ -1190,8 +1190,14 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 	}
 }
 
-func writeSocket(chanWrite chan []byte, wsSocket *websocket.Conn) {
+func writeSocket(chanWrite chan []byte, wsSocket *websocket.Conn, done <-chan struct{}) {
 	for buf := range chanWrite {
+		// The client is gone: keep draining so in-flight dispatchers never block on their send.
+		select {
+		case <-done:
+			continue
+		default:
+		}
 		err := wsSocket.WriteMessage(websocket.BinaryMessage, buf)
 
 		if err != nil {
@@ -1201,7 +1207,12 @@ func writeSocket(chanWrite chan []byte, wsSocket *websocket.Conn) {
 	}
 }
 
-func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn) {
+func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn, done chan<- struct{}) {
+	// Without these a client that disconnected without "exit" left its socket open (CLOSED in lsof)
+	// and writeSocket waiting on chanWrite forever. Only readSocket sends on chanRead.
+	defer close(chanRead)
+	defer close(done)
+	defer wsSocket.Close()
 	for {
 		_, message, err := wsSocket.ReadMessage()
 		if err != nil {
@@ -1213,14 +1224,15 @@ func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn) {
 		}
 		var baseMessage map[string]interface{}
 		if err := json.Unmarshal(message, &baseMessage); err != nil {
+			// One bad message must not end the client's request loop.
 			log.Print("Unmarshal Error", err)
-			return
+			continue
 		}
 		if action, ok := baseMessage["action"]; ok {
 			if action == "exit" {
-				// Respond by sending a close frame and then close the connection.
-				wsSocket.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "exit"))
-				wsSocket.Close()
+				// Respond with a close frame; the deferred Close ends the connection. WriteControl,
+				// unlike WriteMessage, is safe alongside writeSocket's concurrent writes.
+				_ = wsSocket.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "exit"), time.Now().Add(time.Second))
 				return
 			}
 			if action == "cancel" {
@@ -1238,7 +1250,7 @@ func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn) {
 		request := new(cycleTLSRequest)
 		if err := json.Unmarshal(message, &request); err != nil {
 			log.Print("Unmarshal Error", err)
-			return
+			continue
 		}
 		chanRead <- processRequest(*request)
 	}
@@ -1246,9 +1258,18 @@ func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn) {
 
 // Worker
 func readProcess(chanRead chan fullRequest, chanWrite chan []byte) {
+	var inFlight sync.WaitGroup
 	for request := range chanRead {
-		go dispatcherAsync(request, chanWrite)
+		inFlight.Add(1)
+		go func() {
+			defer inFlight.Done()
+			dispatcherAsync(request, chanWrite)
+		}()
 	}
+	// chanRead closes when the client is gone. Closing chanWrite after the last dispatcher's
+	// final send (never before: a send on a closed channel panics) lets writeSocket return.
+	inFlight.Wait()
+	close(chanWrite)
 }
 
 var upgrader = websocket.Upgrader{
@@ -1289,11 +1310,13 @@ func WSEndpoint(w nhttp.ResponseWriter, r *nhttp.Request) {
 		chanRead := make(chan fullRequest)
 		chanWrite := make(chan []byte)
 
-		go readSocket(chanRead, ws)
+		done := make(chan struct{})
+
+		go readSocket(chanRead, ws, done)
 		go readProcess(chanRead, chanWrite)
 
 		// Run as main thread
-		writeSocket(chanWrite, ws)
+		writeSocket(chanWrite, ws, done)
 	}
 }
 

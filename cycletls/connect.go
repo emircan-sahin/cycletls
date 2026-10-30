@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+	"time"
 
 	http "github.com/Danny-Dasilva/fhttp"
 	http2 "github.com/Danny-Dasilva/fhttp/http2"
@@ -42,6 +43,9 @@ type connectDialer struct {
 	// overridden DialTLS allows user to control establishment of TLS connection
 	// MUST return connection with completed Handshake, and NegotiatedProtocol
 	DialTLS func(network string, address string) (net.Conn, string, error)
+
+	// Bounds the HTTP/1 CONNECT exchange when ctx has no deadline (redials use Background).
+	Timeout time.Duration
 
 	EnableH2ConnReuse  bool
 	cacheH2Mu          sync.Mutex
@@ -188,6 +192,16 @@ func (c *connectDialer) DialContext(ctx context.Context, network, address string
 		req.ProtoMajor = 1
 		req.ProtoMinor = 1
 
+		// A proxy that accepts and never answers would block here, under the roundTripper's lock.
+		deadline, ok := ctx.Deadline()
+		if !ok && c.Timeout > 0 {
+			deadline = time.Now().Add(c.Timeout)
+		}
+		if err := rawConn.SetDeadline(deadline); err != nil {
+			_ = rawConn.Close()
+			return nil, err
+		}
+
 		err := req.Write(rawConn)
 		if err != nil {
 			_ = rawConn.Close()
@@ -203,6 +217,10 @@ func (c *connectDialer) DialContext(ctx context.Context, network, address string
 		if resp.StatusCode != http.StatusOK {
 			_ = rawConn.Close()
 			return nil, errors.New("Proxy responded with non 200 code: " + resp.Status + " StatusCode:" + strconv.Itoa(resp.StatusCode))
+		}
+		if err := rawConn.SetDeadline(time.Time{}); err != nil {
+			_ = rawConn.Close()
+			return nil, err
 		}
 		return rawConn, nil
 	}

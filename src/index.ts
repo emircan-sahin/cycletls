@@ -9,6 +9,7 @@ import { Readable, Writable } from 'stream';
 import { promisify } from 'util';
 import stream from 'stream';
 import { Blob } from 'buffer';
+import { randomUUID } from 'crypto';
 const pipeline = promisify(stream.pipeline);
 
 export interface Cookie {
@@ -598,7 +599,9 @@ class CycleTLSClientImpl extends EventEmitter {
     const urlObj = new URL(url);
     const hostKey = urlObj.host;
 
-    const requestId = `${this.clientId}#${url}#${Date.now()}-${Math.floor(1000 * Math.random())}`;
+    // Date.now() plus a 0-999 random collided for two requests to one URL in the same ms,
+    // and each got the other's frames.
+    const requestId = `${this.clientId}#${url}#${randomUUID()}`;
 
     //set default options
     options ??= {}
