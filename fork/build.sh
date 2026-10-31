@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Builds @emircansahin/cycletls: upstream cycletls@2.0.5 from npm with its seven Go binaries
-# rebuilt from this branch (2.0.5 + the fixes in fork/README.md), one patched line in
-# dist/index.js, and the Go source the binaries were built from.
+# Builds @emircansahin/cycletls: upstream cycletls@2.0.5's npm package with its JavaScript compiled
+# from this branch's src/index.ts and its seven Go binaries rebuilt from this branch (2.0.5 + the
+# fixes in fork/README.md), plus the Go source the binaries were built from.
 # Usage: fork/build.sh <out-dir>   then: cd <out-dir>/package && npm publish --access public --tag latest
 set -euo pipefail
 
 UPSTREAM=2.0.5
-VERSION=2.0.5-patch.3
+VERSION=2.0.5-patch.4
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$(mkdir -p "$1" && cd "$1" && pwd)"
 PKG="$OUT/package"
@@ -14,20 +14,15 @@ PKG="$OUT/package"
 rm -rf "$PKG" "$OUT/cycletls-$UPSTREAM.tgz"
 (cd "$OUT" && npm pack "cycletls@$UPSTREAM" --silent >/dev/null && tar xzf "cycletls-$UPSTREAM.tgz")
 
-# Request ids: Date.now() plus a 0-999 random collided for two requests to one URL in the same ms
-# (each got the other's frames). Same change as src/index.ts; fail if upstream's text moved.
-node -e '
-  const fs = require("fs");
-  const file = process.argv[1];
-  const from = "${this.clientId}#${url}#${Date.now()}-${Math.floor(1000 * Math.random())}";
-  const to = "${this.clientId}#${url}#${require(\"crypto\").randomUUID()}";
-  const source = fs.readFileSync(file, "utf8");
-  if (source.split(from).length !== 2) {
-    console.error("build.sh: request id expression not found exactly once in " + file);
-    process.exit(1);
-  }
-  fs.writeFileSync(file, source.split(from).join(to));
-' "$PKG/dist/index.js"
+# The JavaScript from src/index.ts. Upstream's a96895f source compiles with this tsconfig to the
+# same dist/index.js npm ships (checked 2026-10-31), so the fixes are the only difference.
+TSC="$ROOT/node_modules/.bin/tsc"
+[ -x "$TSC" ] || { echo "build.sh: run npm install in $ROOT first (tsc)" >&2; exit 1; }
+"$TSC" -p "$ROOT/tsconfig.json" --outDir "$PKG/dist" --declarationDir "$PKG/dist"
+
+# Pinned: the stdlib's crypto/x509 is what utls verifies certificates with, and patch.3's go1.26.1
+# missed its fixes (GO-2026-4946, -4947, -6809). The go command fetches this toolchain if needed.
+export GOTOOLCHAIN=go1.26.10
 
 # Same targets and file names as upstream's build:go scripts, so its dist/index.js finds them.
 targets=(
@@ -54,7 +49,7 @@ node -e '
   Object.assign(pkg, {
     name: "@emircansahin/cycletls",
     version: process.argv[2],
-    description: "CycleTLS 2.0.5 with fixes for kept connections, WebSocket client leaks, a transport map race, stalled proxies and request id collisions",
+    description: "CycleTLS 2.0.5 with fixes for a dead Go process hanging requests, per-request crashes, kept connections, WebSocket client leaks, a transport map race, stalled proxies and request id collisions",
     files: ["/dist", "/go"],
     license: "GPL-3.0",
     repository: { type: "git", url: "git+https://github.com/emircan-sahin/cycletls.git", directory: "fork" },
