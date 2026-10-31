@@ -146,12 +146,17 @@ class InstanceManager {
     return sharedInstance;
   }
 
-  async removeSharedInstance(port: number): Promise<void> {
-    const sharedInstance = this.sharedInstances.get(port);
+  async removeSharedInstance(port: number, instance?: SharedInstance): Promise<void> {
+    const sharedInstance = instance ?? this.sharedInstances.get(port);
     if (sharedInstance) {
+      this.forget(port, sharedInstance);
       await sharedInstance.cleanup();
-      this.sharedInstances.delete(port);
     }
+  }
+
+  /** Drops the port's entry if it is still this instance: a lost one may already have a successor. */
+  forget(port: number, instance: SharedInstance): void {
+    if (this.sharedInstances.get(port) === instance) this.sharedInstances.delete(port);
   }
 
   async cleanup(): Promise<void> {
@@ -175,6 +180,8 @@ class SharedInstance extends EventEmitter {
   private failedInitialization: boolean = false;
   private isShuttingDown: boolean = false;
   private httpServer: http.Server | null = null;
+  /** The end of the Go process's stderr, reported with its exit: an unrecovered panic is written there. */
+  private stderrTail: string = '';
 
   constructor(port: number, debug: boolean, timeout: number, executablePath?: string) {
     super();
@@ -223,7 +230,9 @@ class SharedInstance extends EventEmitter {
     });
 
     // Start listening last so that the above listeners are in place
-    this.httpServer.listen(this.port);
+    // Loopback, where the Go server listens: probing every interface could find the port free
+    // while the server holds it on 127.0.0.1.
+    this.httpServer.listen(this.port, '127.0.0.1');
   }
 
   private spawnServer(): void {
@@ -279,29 +288,19 @@ class SharedInstance extends EventEmitter {
         console.log(stdout.toString());
       });
       
+      // Go logs per-request failures here; they are answered as error frames. What matters is
+      // the exit: respawning on stderr patterns restarted on the same port in a loop (upstream
+      // #428) and, with recovered panics logged here too, would kill a healthy process.
       this.child.stderr.on("data", (stderr) => {
         const errorMessage = stderr.toString();
-        if (errorMessage.includes("Request_Id_On_The_Left")) {
-          const [requestId, error] = errorMessage.split("Request_Id_On_The_Left");
-          // Handle request-specific error
-        } else {
-          // Only restart on truly fatal errors
-          const fatalErrorPattern = /panic|fatal error|runtime error|address already in use/i;
-          
-          if (fatalErrorPattern.test(errorMessage)) {
-            // Critical error - restart the process
-            this.cleanExit(
-              `Fatal error detected (please open an issue https://github.com/Danny-Dasilva/CycleTLS/issues/new/choose) -> ${errorMessage}`
-            );
-            this.handleSpawn(fileName);
-          } else {
-            // Non-fatal error - just log it for debugging
-            if (this.debug) {
-              console.log(`[DEBUG] stderr: ${errorMessage}`);
-            }
-            // Don't restart for non-fatal errors like read timeouts
-          }
+        this.stderrTail = (this.stderrTail + errorMessage).slice(-2000);
+        if (this.debug) {
+          console.log(`[DEBUG] stderr: ${errorMessage}`);
         }
+      });
+
+      this.child.on("exit", (code, signal) => {
+        this.transportLost(`process exited (${signal ?? code})${this.stderrTail ? `: ${this.stderrTail.trim()}` : ''}`);
       });
 
       // Add error handler for spawn errors
@@ -322,7 +321,8 @@ class SharedInstance extends EventEmitter {
 
   private createClient(resolve: () => void, reject: (reason: string) => void): void {
     const attemptConnection = () => {
-      const server = new WebSocket(`ws://localhost:${this.port}`);
+      // Not `localhost`: it can resolve to ::1, where the server does not listen.
+      const server = new WebSocket(`ws://127.0.0.1:${this.port}`);
 
       server.on("open", () => {
         // When connected, clear the connection timeout if it exists.
@@ -331,6 +331,13 @@ class SharedInstance extends EventEmitter {
           this.connectionTimeout = null;
         }
         this.server = server;
+
+        // Before this, an error meant "not up yet, try again". From here the process or its socket is
+        // gone, and nothing it was sent will be answered: without these, every request waited out
+        // its own timeout until the host process restarted.
+        server.removeAllListeners("error");
+        server.on("error", (error) => this.transportLost(`socket error: ${error.message}`));
+        server.on("close", (code) => this.transportLost(`socket closed (${code})`));
 
         this.server.on("message", (data: Buffer) => {
           const packetBuffer = new PacketBuffer(data);
@@ -433,8 +440,51 @@ class SharedInstance extends EventEmitter {
     
     // If no more clients, cleanup the shared instance
     if (this.clients.size === 0) {
-      InstanceManager.getInstance().removeSharedInstance(this.port);
+      InstanceManager.getInstance().removeSharedInstance(this.port, this);
     }
+  }
+
+  /**
+   * The Go process exited or its socket closed. Pending requests fail with the error the caller
+   * rebuilds on ("WebSocket server not connected"), later ones throw it from `sendRequest`, and
+   * the instance leaves the manager so the next init starts a fresh process.
+   */
+  private transportLost(reason: string): void {
+    if (this.isShuttingDown) return;
+    this.isShuttingDown = true;
+    console.error(`CycleTLS transport on port ${this.port} lost: ${reason}`);
+
+    if (this.server) {
+      this.server.removeAllListeners();
+      // A late error on the dead socket must not go unhandled.
+      this.server.on("error", () => {});
+      this.server.terminate();
+      this.server = null;
+    }
+    // The socket can close while the process lives on; it holds the port the next one needs.
+    if (this.isHost && this.child) {
+      this.killChild();
+    }
+    InstanceManager.getInstance().forget(this.port, this);
+    for (const client of this.clients.values()) {
+      client.failPending(`WebSocket server not connected: CycleTLS ${reason}`);
+    }
+  }
+
+  private killChild(): void {
+    if (!this.child) return;
+    try {
+      if (process.platform === "win32") {
+        this.child.kill('SIGKILL');
+      } else {
+        process.kill(-this.child.pid!, 'SIGKILL');
+      }
+    } catch (error) {
+      if ((error as any).code !== "ESRCH") {
+        console.error("Error killing process:", error);
+      }
+    }
+    this.child = null;
   }
 
   async sendRequest(requestId: string, options: { [key: string]: any }): Promise<void> {
@@ -472,7 +522,10 @@ class SharedInstance extends EventEmitter {
     }
 
     if (this.server) {
-      this.server.send(JSON.stringify({ requestId, options }));
+      // `ws` drops a send on a closing socket and reports it only here.
+      this.server.send(JSON.stringify({ requestId, options }), (error) => {
+        if (error) this.transportLost(`send failed: ${error.message}`);
+      });
     } else {
       throw new Error('WebSocket server not connected');
     }
@@ -510,6 +563,9 @@ class SharedInstance extends EventEmitter {
   }
 
   async cleanup(): Promise<void> {
+    // Intentional: the exit and close it causes are not a lost transport.
+    this.isShuttingDown = true;
+
     // Clear any pending timeouts
     if (this.connectionTimeout) {
       clearTimeout(this.connectionTimeout);
@@ -528,23 +584,8 @@ class SharedInstance extends EventEmitter {
     }
 
     // Kill child process forcefully
-    if (this.isHost && this.child) {
-      if (process.platform === "win32") {
-        try {
-          this.child.kill('SIGKILL');
-        } catch (error) {
-          console.error("Error killing Windows process:", error);
-        }
-      } else {
-        try {
-          process.kill(-this.child.pid!, 'SIGKILL');
-        } catch (error) {
-          if ((error as any).code !== "ESRCH") {
-            console.error("Error killing process:", error);
-          }
-        }
-      }
-      this.child = null;
+    if (this.isHost) {
+      this.killChild();
     }
 
     // Force close the WebSocket immediately
@@ -577,7 +618,7 @@ class CycleTLSClientImpl extends EventEmitter {
   constructor(sharedInstance: SharedInstance) {
     super();
     this.sharedInstance = sharedInstance;
-    this.clientId = `client-${Date.now()}-${Math.floor(10000 * Math.random())}`;
+    this.clientId = `client-${randomUUID()}`;
     
     // Register this client with the shared instance
     this.sharedInstance.addClient(this.clientId, this);
@@ -586,6 +627,15 @@ class CycleTLSClientImpl extends EventEmitter {
     this.on('sharedInstanceClosed', () => {
       this.removeAllListeners();
     });
+  }
+
+  /** Ends every request still waiting on the shared instance, which will answer none of them. */
+  failPending(message: string): void {
+    for (const requestId of this.eventNames()) {
+      if (typeof requestId === 'string' && requestId.startsWith(`${this.clientId}#`)) {
+        this.emit(requestId, { method: 'transportLost', message });
+      }
+    }
   }
 
 
@@ -649,20 +699,15 @@ class CycleTLSClientImpl extends EventEmitter {
     // Set the connection as tracked for this host
     this.connectionsByHost.set(hostKey, true);
     
-    // Send request through shared instance
-    await this.sharedInstance.sendRequest(requestId, {
-      url,
-      ...options,
-      method,
-      // Add metadata about connection reuse (will be ignored by Go if not implemented)
-      _connectionReuse: hasExistingConnection ? "reuse" : "new",
-      _hostKey: hostKey,
-    });
-
     return new Promise((resolveRequest, rejectRequest) => {
       let responseMetadata: any = null;
 
       const handleMessage = async (response: any) => {
+        if (response.method === "transportLost") {
+          this.off(requestId, handleMessage);
+          rejectRequest(new Error(response.message));
+          return;
+        }
         if (response.method === "error") {
           // Handle error before or during body read
           // If we already have response metadata (headers sent successfully but body read failed),
@@ -700,12 +745,11 @@ class CycleTLSClientImpl extends EventEmitter {
           const handleData = (response: any) => {
             if (response.method === "data") {
               stream.push(Buffer.from(response.data));
-            } else if (response.method === "error") {
+            } else if (response.method === "error" || response.method === "transportLost") {
               // Handle error that occurred during body read - store it and close the stream
-              bodyReadError = {
-                statusCode: response.data.statusCode,
-                message: response.data.message
-              };
+              bodyReadError = response.method === "error"
+                ? { statusCode: response.data.statusCode, message: response.data.message }
+                : { statusCode: 0, message: response.message };
               stream.push(null); // Close stream gracefully
               stream.off("close", handleClose);
               this.off(requestId, handleData);
@@ -806,7 +850,20 @@ class CycleTLSClientImpl extends EventEmitter {
         }
       };
 
+      // Listening before sending: a failed send is reported on the next tick, before an await
+      // on it would have resumed and registered this.
       this.on(requestId, handleMessage);
+      this.sharedInstance.sendRequest(requestId, {
+        url,
+        ...options,
+        method,
+        // Add metadata about connection reuse (will be ignored by Go if not implemented)
+        _connectionReuse: hasExistingConnection ? "reuse" : "new",
+        _hostKey: hostKey,
+      }).catch((error) => {
+        this.off(requestId, handleMessage);
+        rejectRequest(error);
+      });
     });
   }
 
