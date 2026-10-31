@@ -34,6 +34,8 @@ func (d *SocksDialer) Dial(network, addr string) (net.Conn, error) {
 }
 
 // connectDialer allows to configure one-time use HTTP CONNECT client
+const proxyDialTimeout = 15 * time.Second
+
 type connectDialer struct {
 	ProxyURL      url.URL
 	DefaultHeader http.Header
@@ -118,7 +120,10 @@ func newConnectDialer(proxyURLStr string, UserAgent string) (proxy.ContextDialer
 		return nil, errors.New("scheme " + proxyURL.Scheme + " is not supported")
 	}
 
-	client.Dialer = &net.Dialer{}
+	// The TCP connect to the proxy had no deadline (upstream #340): HTTP/2 redials pass a context
+	// without one, and a dropped SYN held the roundTripper's lock, every other dial behind it, for
+	// the OS's ~2 min retry.
+	client.Dialer = &net.Dialer{Timeout: proxyDialTimeout, KeepAlive: 30 * time.Second}
 
 	if proxyURL.User != nil {
 		if proxyURL.User.Username() != "" {

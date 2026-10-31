@@ -28,6 +28,29 @@ const (
 	h2PingTimeout     = 15 * time.Second
 )
 
+// connWriteTimeout bounds each write on a TLS connection handed to a transport. fhttp's HTTP/2 is a
+// 2021 copy of x/net without WriteByteTimeout (golang/go#48830): it writes under the connection's
+// locks, so a write into a dead path blocked every request on the connection, the health ping
+// above included (golang/go#48810), until TCP gave up, ~15 min on Linux.
+var connWriteTimeout = 15 * time.Second
+
+// writeDeadlineConn is the TLS connection with each Write under connWriteTimeout; the embedded
+// UConn still answers ConnectionState for the transports.
+type writeDeadlineConn struct {
+	*utls.UConn
+}
+
+func (c writeDeadlineConn) Write(p []byte) (int, error) {
+	if err := c.UConn.SetWriteDeadline(time.Now().Add(connWriteTimeout)); err != nil {
+		return 0, err
+	}
+	n, err := c.UConn.Write(p)
+	if err == nil {
+		err = c.UConn.SetWriteDeadline(time.Time{})
+	}
+	return n, err
+}
+
 type roundTripper struct {
 	sync.Mutex
 
@@ -277,6 +300,13 @@ func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.
 	if err != nil {
 		return nil, err
 	}
+	// A spec or preset that fails left the dialed connection open.
+	handedOn := false
+	defer func() {
+		if !handedOn {
+			_ = rawConn.Close()
+		}
+	}()
 
 	// Extract host from address
 	var host string
@@ -359,9 +389,11 @@ func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.
 		return nil, fmt.Errorf("uTlsConn.Handshake() error: %+v", err)
 	}
 
+	handedOn = true
+
 	// If transport already exists, return connection
 	if rt.cachedTransport(addr) != nil {
-		return conn, nil
+		return writeDeadlineConn{conn}, nil
 	}
 
 	// Create appropriate transport based on negotiated protocol
@@ -409,7 +441,7 @@ func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.
 	}
 
 	// Cache the connection for future use
-	rt.cachedConnections[addr] = conn
+	rt.cachedConnections[addr] = writeDeadlineConn{conn}
 
 	return nil, errProtocolNegotiated
 }
@@ -421,6 +453,12 @@ func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, netw
 	if err != nil {
 		return nil, err
 	}
+	handedOn := false
+	defer func() {
+		if !handedOn {
+			_ = rawConn.Close()
+		}
+	}()
 
 	var spec *utls.ClientHelloSpec
 
@@ -468,11 +506,12 @@ func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, netw
 		_ = conn.Close()
 		return nil, fmt.Errorf("TLS 1.3 compatible handshake failed: %+v", err)
 	}
+	handedOn = true
 
 	// A redial from the existing transport: hand it the conn, as dialTLS does, instead of
 	// replacing a working transport and failing its request with errProtocolNegotiated.
 	if rt.cachedTransport(addr) != nil {
-		return conn, nil
+		return writeDeadlineConn{conn}, nil
 	}
 
 	// Create appropriate transport based on negotiated protocol
@@ -517,7 +556,7 @@ func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, netw
 	}
 
 	// Cache the successful TLS 1.3 connection
-	rt.cachedConnections[addr] = conn
+	rt.cachedConnections[addr] = writeDeadlineConn{conn}
 
 	return nil, errProtocolNegotiated
 }
@@ -529,6 +568,12 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 	if err != nil {
 		return nil, err
 	}
+	handedOn := false
+	defer func() {
+		if !handedOn {
+			_ = rawConn.Close()
+		}
+	}()
 
 	// Use original TLS 1.2 JA3 spec (no upgrade)
 	spec, err := StringToSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1)
@@ -553,10 +598,11 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 		_ = conn.Close()
 		return nil, fmt.Errorf("original TLS 1.2 handshake failed: %+v", err)
 	}
+	handedOn = true
 
 	// Same as the TLS 1.3 retry: a redial keeps the existing transport.
 	if rt.cachedTransport(addr) != nil {
-		return conn, nil
+		return writeDeadlineConn{conn}, nil
 	}
 
 	// Create appropriate transport based on negotiated protocol
@@ -601,7 +647,7 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 	}
 
 	// Cache the successful TLS 1.2 fallback connection
-	rt.cachedConnections[addr] = conn
+	rt.cachedConnections[addr] = writeDeadlineConn{conn}
 
 	return nil, errProtocolNegotiated
 }
