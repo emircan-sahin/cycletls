@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	nhttp "net/http"
 	"net/url"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -103,6 +105,8 @@ type fullRequest struct {
 	options   cycleTLSRequest
 	sseClient *SSEClient       // For SSE connections
 	wsClient  *WebSocketClient // For WebSocket connections
+	// Set when the request could not be built; the dispatcher answers it with an error frame.
+	err error
 }
 
 // CycleTLS creates full request and response
@@ -187,7 +191,8 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 		request.Options.Proxy,
 	)
 	if err != nil {
-		log.Fatal(err)
+		cancel()
+		return fullRequest{options: request, err: err}
 	}
 
 	// Handle both string body and byte body
@@ -199,7 +204,8 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 	}
 	req, err := http.NewRequestWithContext(ctx, strings.ToUpper(request.Options.Method), request.Options.URL, bodyReader)
 	if err != nil {
-		log.Fatal(err)
+		cancel()
+		return fullRequest{options: request, err: err}
 	}
 	headerorder := []string{}
 	//master header order, all your headers will be ordered based on this list and anything extra will be appended to the end
@@ -339,7 +345,8 @@ func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
 		request.Options.Proxy,
 	)
 	if err != nil {
-		log.Fatal(err)
+		cancel()
+		return fullRequest{options: request, err: err}
 	}
 
 	// Handle both string body and byte body
@@ -351,7 +358,8 @@ func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
 	}
 	req, err := http.NewRequestWithContext(ctx, strings.ToUpper(request.Options.Method), request.Options.URL, bodyReader)
 	if err != nil {
-		log.Fatal(err)
+		cancel()
+		return fullRequest{options: request, err: err}
 	}
 
 	// Set headers for HTTP/3 request
@@ -597,6 +605,11 @@ func dispatchWebSocketRequest(request cycleTLSRequest) (result fullRequest) {
 // }
 
 func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
+	if res.err != nil {
+		chanWrite <- errorFrame(res.options.RequestID, noResponseStatus, "CycleTLS could not build the request: "+res.err.Error())
+		return
+	}
+
 	// Handle SSE connections
 	if res.sseClient != nil {
 		dispatchSSEAsync(res, chanWrite)
@@ -1250,9 +1263,13 @@ func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn, done chan<-
 		request := new(cycleTLSRequest)
 		if err := json.Unmarshal(message, &request); err != nil {
 			log.Print("Unmarshal Error", err)
+			// Answered rather than dropped: the caller would otherwise wait out its own timeout.
+			if requestID, ok := baseMessage["requestId"].(string); ok {
+				chanRead <- fullRequest{options: cycleTLSRequest{RequestID: requestID}, err: err}
+			}
 			continue
 		}
-		chanRead <- processRequest(*request)
+		chanRead <- buildRequest(*request)
 	}
 }
 
@@ -1263,6 +1280,13 @@ func readProcess(chanRead chan fullRequest, chanWrite chan []byte) {
 		inFlight.Add(1)
 		go func() {
 			defer inFlight.Done()
+			// One request's panic used to end the process, and every other request with it.
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					log.Printf("Recovered request %s: %v\n%s", request.options.RequestID, recovered, debug.Stack())
+					chanWrite <- errorFrame(request.options.RequestID, noResponseStatus, fmt.Sprintf("CycleTLS failed handling the request: %v", recovered))
+				}
+			}()
 			dispatcherAsync(request, chanWrite)
 		}()
 	}
@@ -1272,6 +1296,44 @@ func readProcess(chanRead chan fullRequest, chanWrite chan []byte) {
 	close(chanWrite)
 }
 
+// buildRequest turns a parsed message into a request, as an error to answer if building it panicked:
+// it runs on the socket's read loop, where a panic took every client of the process down.
+func buildRequest(request cycleTLSRequest) (result fullRequest) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf("Recovered building request %s: %v\n%s", request.RequestID, recovered, debug.Stack())
+			result = fullRequest{options: request, err: fmt.Errorf("%v", recovered)}
+		}
+	}()
+	return processRequest(request)
+}
+
+// noResponseStatus marks an error frame for a request that never reached the target. CycleTLS
+// already reports a connection closed before any answer as 0; an HTTP status like 400 or 500 read
+// as the target's own answer, so a caller retried nothing and credited the proxy.
+const noResponseStatus = 0
+
+// errorFrame is the "error" frame the Node client reads: id, method, status and message, each
+// length-prefixed with two bytes, so the message is cut to fit.
+func errorFrame(requestID string, statusCode int, message string) []byte {
+	if len(message) > 0xFFFF {
+		message = message[:0xFFFF]
+	}
+	var b bytes.Buffer
+	b.WriteByte(byte(len(requestID) >> 8))
+	b.WriteByte(byte(len(requestID)))
+	b.WriteString(requestID)
+	b.WriteByte(0)
+	b.WriteByte(5)
+	b.WriteString("error")
+	b.WriteByte(byte(statusCode >> 8))
+	b.WriteByte(byte(statusCode))
+	b.WriteByte(byte(len(message) >> 8))
+	b.WriteByte(byte(len(message)))
+	b.WriteString(message)
+	return b.Bytes()
+}
+
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
@@ -1279,7 +1341,9 @@ var upgrader = websocket.Upgrader{
 
 // WSEndpoint exports the main cycletls function as we websocket connection that clients can connect to
 func WSEndpoint(w nhttp.ResponseWriter, r *nhttp.Request) {
-	upgrader.CheckOrigin = func(r *nhttp.Request) bool { return true }
+	// The Node client sends no Origin; a browser always does. Refusing those keeps a web page open
+	// on the same machine from using this loopback port as a relay.
+	upgrader.CheckOrigin = func(r *nhttp.Request) bool { return r.Header.Get("Origin") == "" }
 
 	// upgrade this connection to a WebSocket
 	// connection
@@ -1327,10 +1391,11 @@ func setupRoutes() {
 func main() {
 	port, exists := os.LookupEnv("WS_PORT")
 	var addr *string
+	// Loopback only: every interface made it an open proxy to anyone who could reach the port.
 	if exists {
-		addr = flag.String("addr", ":"+port, "http service address")
+		addr = flag.String("addr", "127.0.0.1:"+port, "http service address")
 	} else {
-		addr = flag.String("addr", ":9112", "http service address")
+		addr = flag.String("addr", "127.0.0.1:9112", "http service address")
 	}
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
